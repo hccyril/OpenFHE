@@ -31,6 +31,13 @@
 
 /*
 BFV implementation. See https://eprint.iacr.org/2021/204 for details.
+
+[CN] 说明：本文件实现 BFV 的 RNS/CRT 预计算（对应 ePrint 2021/204 的现代化实现）。
+     主要为加密、解密、同态乘法（含基扩展/切换与缩放取整）准备各种查表系数：
+     - Q=∏q_i 的分量模与原根（NTT）
+     - t、Q 及扩展基 R/BSK 之间的“帽子值/逆元/Barrett 常数/分式与模值部分”
+     - HPS/HPSPOVERQ/BEHZ 三种乘法路径所需的常数
+     这些预计算在运行期复用，可避免大整数逆与昂贵 CRT 重构，加速 BFV 的实际执行。
  */
 
 #define PROFILE
@@ -41,11 +48,16 @@ BFV implementation. See https://eprint.iacr.org/2021/204 for details.
 namespace lbcrypto {
 
 // Precomputation of CRT tables for encryption, decryption, and homomorphic multiplication
+// [CN] 为加密/解密/同态乘法生成 CRT/RNS 预计算表。不同乘法技术（HPS/HPSPOVERQ/BEHZ）
+//     使用不同分支，均遵循 2021/204 的工程化套路：
+//     先离线准备齐全的基扩展/缩放-取整/丢链所需常数，运行期直接查表合成。
 void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, ScalingTechnique scalTech,
                                                  EncryptionTechnique encTech, MultiplicationTechnique multTech,
                                                  uint32_t numPartQ, uint32_t auxBits, uint32_t extraBits) {
+    // [CN] 父类通用预处理
     CryptoParametersRNS::PrecomputeCRTTables(ksTech, scalTech, encTech, multTech, numPartQ, auxBits, extraBits);
 
+    // [CN] t（明文模）、n（环维）、Q 及其分量参数（q_i 与原根）
     NativeInteger t     = GetPlaintextModulus();
     uint32_t n          = GetElementParams()->GetRingDimension();
     BigInteger modulusQ = GetElementParams()->GetModulus();
@@ -63,6 +75,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
 
     const auto BarrettBase128Bit(BigInteger(1).LShiftEq(128));
     for (const auto& p : paramsQ) {
+        // [CN] t^{-1} mod q_i 与 Barrett 常数 μ_i（近似 2^128 / q_i）
         m_tInvModq.emplace_back(t.ModInverse(p->GetModulus()));
         m_modqBarrettMu.emplace_back((BarrettBase128Bit / BigInteger(p->GetModulus())).ConvertToInt<DoubleNativeInt>());
         moduliQ.emplace_back(p->GetModulus());
@@ -72,6 +85,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
     /////////////////////////////////////
     // BFVrns : Encrypt
     /////////////////////////////////////
+    // [CN] 加密相关：准备 -Q^(l) mod t 以及可选扩展质数 r（EXTENDED），用于更稳健的编码/还原。
 
     NativeInteger modulusr = PreviousPrime<NativeInteger>(moduliQ[sizeQ - 1], 2 * n);
     NativeInteger rootr    = RootOfUnity<NativeInteger>(2 * n, modulusr);
@@ -92,6 +106,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
     }
 
     // BFVrns : Encrypt : With extra
+    // [CN] EXTENDED：构造 Q∪{r} 的参数（t^{-1} 在 r 上、-Qr mod t 等）。
     if (encTech == EXTENDED) {
         std::vector<NativeInteger> moduliQr(sizeQ + 1);
         std::vector<NativeInteger> rootsQr(sizeQ + 1);
@@ -122,6 +137,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
     /////////////////////////////////////
     // HPS Precomputation
     /////////////////////////////////////
+    // [CN] HPS/HPSPOVERQ(LEVELED)：构造 R 基与跨基变换、缩放取整所需查表（见 2021/204）。
 
     if (multTech != BEHZ) {
         size_t sizeR = (multTech == HPS) ? sizeQ + 1 : sizeQ;
@@ -144,6 +160,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         // BFVrns : Mult : ExpandCRTBasis
         // Pre-compute values [Ql/q_i]_{r_j}
         // Pre-compute values [(Ql/q_i)^{-1}]_{q_i}
+        // [CN] 跨基扩展时的帽子值与逆元（从 Q 到 R）。
 
         tmpModulusQ = modulusQ;
 
@@ -204,6 +221,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         }
 
         // BFVrns : Mult : ExpandCRTBasis
+        // [CN] 为每层/整体构造 Q、R 与它们的合并基 Q∪R 的参数对象，支持 leveled 处理。
         if (multTech == HPS) {
             m_paramsQl.resize(1);
             m_paramsRl.resize(1);
@@ -260,6 +278,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
             m_modrBarrettMu[j] = (BarrettBase128Bit / BigInteger(moduliR[j])).ConvertToInt<DoubleNativeInt>();
         }
 
+        // [CN] 1/q_i 与 1/r_j 的 double 近似
         m_qInv.resize(sizeQ);
         for (size_t i = 0; i < sizeQ; i++) {
             m_qInv[i] = 1. / static_cast<double>(moduliQ[i].ConvertToInt());
@@ -268,6 +287,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : ScaleAndRound
         /////////////////////////////////////
+        // [CN] 乘法后的缩放与取整（整数 + 小数部分分解），避免高精度除法与多次 CRT。
 
         const BigInteger modulusR = multTech == HPSPOVERQLEVELED || multTech == HPSPOVERQ ?
                                         m_paramsRl[sizeQ - 1]->GetModulus() :
@@ -307,7 +327,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : SwitchCRTBasis
         /////////////////////////////////////
-
+        // [CN] leveled：维护 Q_l、R_l 及其帽子，配合上面的表完成逐层基切换与缩放。
         std::vector<BigInteger> Ql(sizeQ + 1);
         std::vector<BigInteger> Rl(sizeQ + 1);
         std::vector<BigInteger> QlRl(sizeQ + 1);
@@ -333,6 +353,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         }
 
         // BFVrns : Mult : ExpandCRTBasis
+        // [CN] 预存 α*Q_l 与 α*R_l 在对方基上的像（线性组合系数），加速跨基线性合成。
         if (multTech == HPS) {
             m_alphaQlModr.resize(1);
             m_alphaQlModr[0].resize(sizeQ + 1, std::vector<NativeInteger>(sizeR));
@@ -358,6 +379,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
 
         // Pre-compute values [Rl/r_j]_{q_i}
         // Pre-compute values [(Rl/r_j)^{-1}]_{r_j}
+        // [CN] R 帽子在 q_i 上的像与其在 r_j 上的逆，用于从 R 回到 Q。
         if (multTech == HPS) {
             m_RlHatInvModr.resize(1);
             m_RlHatInvModrPrecon.resize(1);
@@ -404,6 +426,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
 
         // compute [\alpha*Rl]_{q_i} for 0 <= alpha <= sizeRl
         // used for homomorphic multiplication
+        // [CN] 预存 α*R_l 在 q_i 的像（线性组合系数）。
         if (multTech == HPS) {
             m_alphaRlModq.resize(1);
             m_alphaRlModq[0].resize(sizeR + 1, std::vector<NativeInteger>(sizeQ));
@@ -435,6 +458,8 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Decrypt : ScaleAndRound
         /////////////////////////////////////
+        // [CN] 解密时 (t/Q)*(...) 的分解：整数部分（mod t）+ 小数部分（double），
+        //     大位宽时使用“平衡”技巧（BDivq）降低浮点误差。
 
         usint qMSB     = moduliQ[0].GetMSB();
         usint sizeQMSB = GetMSB64(sizeQ);
@@ -486,6 +511,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : FastExpandCRTBasisPloverQ
         /////////////////////////////////////
+        // [CN] 从 Q 到 P_l(R_l) 的快速扩展基：预存 -R_l*(Q^/q_i)^{-1} 等常数。
 
         if (multTech == HPSPOVERQ || multTech == HPSPOVERQLEVELED) {
             // Scenario when we go from Q to P_l
@@ -521,6 +547,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
             }
         }
 
+        // [CN] q_i^{-1} mod r_j：跨基映射所需比例因子
         m_qInvModr.resize(sizeQ);
         for (usint i = 0; i < sizeQ; i++) {
             m_qInvModr[i].resize(sizeR);
@@ -534,7 +561,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : ScaleAndRoundP
         /////////////////////////////////////
-
+        // [CN] R 侧的缩放取整，同样分解为分式与模值两部分，逐层或整体处理。
         if (multTech == HPS) {
             m_tQlSlHatInvModsDivsFrac.resize(1);
 
@@ -595,7 +622,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : ScaleAndRoundQl
         /////////////////////////////////////
-
+        // [CN] Q_l 侧的缩放-取整（逐层），用于丢链或回到标准 Q 基。
         m_QlQHatInvModqDivqModq.resize(sizeQ);
         m_QlQHatInvModqDivqFrac.resize(sizeQ);
         for (usint l = sizeQ; l > 0; l--) {
@@ -625,7 +652,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // BFVrns : Mult : ExpandCRTBasisQlHat
         /////////////////////////////////////
-
+        // [CN] Q_l^ 在 q_i 的像与其预处理（常数模乘），用于快速展开。
         m_QlHatModq.resize(sizeQ);
         m_QlHatModqPrecon.resize(sizeQ);
         for (usint l = sizeQ; l > 0; l--) {
@@ -641,6 +668,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
         /////////////////////////////////////
         // DropLastElementAndScale
         /////////////////////////////////////
+        // [CN] 丢弃末尾质数并重缩放（链裁剪）。预存所需的权重与逆元，参见 2021/204。
 
         // Pre-compute omega values for rescaling in RNS
         // modulusQ holds Q^(l) = \prod_{i=0}^{i=l}(q_i).
@@ -669,6 +697,7 @@ void CryptoParametersBFVRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Scal
     /////////////////////////////////////
     // BEHZ Precomputation
     /////////////////////////////////////
+    // [CN] BEHZ：通过 B 基与 mtilde/msk 等辅助模实现快速基切换与近似除法。
 
     if (multTech == BEHZ) {
         m_moduliQ = moduliQ;

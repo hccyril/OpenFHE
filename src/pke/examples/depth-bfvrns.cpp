@@ -310,5 +310,9 @@ int main(int argc, char* argv[]) {
     std::cout << "\nResult of 3 homomorphic multiplications: \n";
     std::cout << plaintextDecMult123 << std::endl;
 
+    std::cout << "all done!" << std::endl;
+    std::cout << "Press 0 and enter to exit: ";
+    int done_x;
+    std::cin >> done_x;
     return 0;
 }
